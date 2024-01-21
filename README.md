@@ -1,3 +1,6 @@
+[![Crates.io](https://img.shields.io/crates/v/oneshot-broadcast)](https://crates.io/crates/oneshot-broadcast)
+[![Documentation](https://docs.rs/oneshot-broadcast/badge.svg)](https://docs.rs/oneshot-broadcast)
+
 # oneshot-broadcast
 A oneshot-broadcast channel that broadcasts a value once without cloning the message.
 
