@@ -1,3 +1,5 @@
+#[doc = include_str!("../README.md")]
+
 pub(crate) mod channel;
 pub(crate) mod opt_vec;
 
