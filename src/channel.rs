@@ -44,7 +44,12 @@ impl<T> Channel<T> {
     }
 
     pub(crate) fn close(&self) -> bool {
-        self.inner.set_state_closed()
+        if self.inner.set_state_closed() {
+            self.wake_all();
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn get(&self) -> Option<Result<&T, RecvError>> {
@@ -141,7 +146,7 @@ impl InnerChannel {
         }
     }
 
-    pub(crate) fn listener_fut<'a>(&'a self, pos: &'a mut Option<usize>) -> ExitFut<'a> {
+    pub(crate) fn exit_fut<'a>(&'a self, pos: &'a mut Option<usize>) -> ExitFut<'a> {
         ExitFut { pos, channel: self }
     }
 
@@ -164,12 +169,12 @@ pub(crate) struct ExitFut<'a> {
 
 impl<'a> Unpin for ExitFut<'a> {}
 impl<'a> Future for ExitFut<'a> {
-    type Output = ();
+    type Output = Result<(), RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Return if the value is ready
-        if self.channel.ready() {
-            return Poll::Ready(());
+        if let Some(state) = self.channel.state() {
+            return Poll::Ready(state);
         }
 
         // Replace our waker if it's not the same as the one we have.
@@ -188,8 +193,8 @@ impl<'a> Future for ExitFut<'a> {
         }
 
         // Check if the value is ready again.
-        if self.channel.ready() {
-            Poll::Ready(())
+        if let Some(state) = self.channel.state() {
+            Poll::Ready(state)
         } else {
             Poll::Pending
         }

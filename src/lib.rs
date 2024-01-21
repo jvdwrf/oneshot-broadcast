@@ -1,5 +1,4 @@
 #[doc = include_str!("../README.md")]
-
 pub(crate) mod channel;
 pub(crate) mod opt_vec;
 
@@ -167,15 +166,8 @@ impl<T> Future for Receiver<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut fut = this.channel.inner().listener_fut(&mut this.pos);
-
-        match Pin::new(&mut fut).poll(cx) {
-            Poll::Ready(()) => Poll::Ready(match this.get().unwrap() {
-                Ok(_) => Ok(()),
-                Err(_) => Err(RecvError),
-            }),
-            Poll::Pending => Poll::Pending,
-        }
+        let mut fut = this.channel.inner().exit_fut(&mut this.pos);
+        Pin::new(&mut fut).poll(cx)
     }
 }
 
@@ -271,12 +263,8 @@ impl Future for Listener {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut fut = this.dyn_channel.listener_fut(&mut this.pos);
-
-        match Pin::new(&mut fut).poll(cx) {
-            Poll::Ready(()) => Poll::Ready(this.get().unwrap()),
-            Poll::Pending => Poll::Pending,
-        }
+        let mut fut = this.dyn_channel.exit_fut(&mut this.pos);
+        Pin::new(&mut fut).poll(cx)
     }
 }
 
@@ -290,8 +278,8 @@ impl Drop for Listener {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_send() {
@@ -330,5 +318,37 @@ mod tests {
         assert!(sender.send(()));
         assert!(listener.downcast::<()>().is_some());
         assert!(listener.downcast::<i32>().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_drop_sender() {
+        let (sender, mut receiver) = channel::<()>();
+
+        drop(sender);
+        assert!(receiver.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_drop_sender_while_receiving() {
+        let (sender, mut receiver) = channel::<()>();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(sender);
+        });
+
+        assert!(receiver.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_while_receiving() {
+        let (mut sender, mut receiver) = channel::<()>();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            sender.send(());
+        });
+
+        assert!(receiver.recv().await.is_ok());
     }
 }
