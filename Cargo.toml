@@ -1,9 +1,17 @@
 [package]
 name = "oneshot-broadcast"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "MIT OR Apache-2.0"
+keywords = ["channel", "oneshot", "broadcast", "sync"]
+categories = ["asynchronous", "concurrency", "data-structures"]
+description = "Sets implemented in the rust type-system"
+homepage = "https://github.com/jvdwrf/oneshot-broadcast"
+repository = "https://github.com/jvdwrf/oneshot-broadcast"
+readme = "README.md"
 
 [dependencies]
 safer_owning_ref = "0.5"
+
+[dev-dependencies]
+tokio = { version = "1.16", features = ["full"] }

@@ -1,7 +1,7 @@
 pub(crate) mod channel;
 pub(crate) mod opt_vec;
 
-use channel::{Channel, DynChannel};
+use channel::{Channel, InnerChannel};
 use owning_ref::OwningRef;
 use std::{
     any::Any,
@@ -34,21 +34,23 @@ pub struct Sender<T> {
 impl<T> Sender<T> {
     /// Send a value to all receivers.
     ///
-    /// Does nothing if the value has already been sent.
-    pub fn send(&mut self, value: T)
+    /// Returns `false` if a value has already been sent.
+    pub fn send(&mut self, value: T) -> bool
     where
         T: 'static,
     {
         // First we set the value.
-        self.channel.set(value);
+        let res = self.channel.set(value);
 
         // Then we wake all the wakers.
         self.channel.wake_all();
+
+        res
     }
 
     /// Whether the message has been sent.
     pub fn is_sent(&self) -> bool {
-        self.channel.is_sent()
+        self.channel.ready()
     }
 
     /// Get the value if it has been sent.
@@ -60,11 +62,16 @@ impl<T> Sender<T> {
     pub fn receiver_count(&self) -> usize {
         Arc::strong_count(&self.channel) - 1
     }
+
+    /// Closes the channel.
+    pub fn close(&mut self) -> bool {
+        self.channel.close()
+    }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.channel.close()
+        self.channel.close();
     }
 }
 
@@ -85,7 +92,8 @@ pub struct Receiver<T> {
     pos: Option<usize>,
 }
 
-#[derive(Clone, Copy)]
+/// The channel was closed before the message was sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvError;
 
 impl<T> Receiver<T> {
@@ -101,9 +109,14 @@ impl<T> Receiver<T> {
         RecvFut { receiver: self }
     }
 
-    /// Whether the message has been sent.
-    pub fn is_sent(&self) -> bool {
-        self.channel.is_sent()
+    /// Closes the channel.
+    pub fn close(&mut self) -> bool {
+        self.channel.close()
+    }
+
+    /// Whether the message has been sent, and is now ready.
+    pub fn ready(&self) -> bool {
+        self.channel.ready()
     }
 
     /// Get the value if it has been sent.
@@ -128,7 +141,7 @@ impl<T> Receiver<T> {
             // Safety: We're not moving the address of the channel
             // T has to be send + Sync for the Listener to be send.
             dyn_channel.map_owner(|channel| {
-                let channel: Arc<dyn IsDynChannel> = channel;
+                let channel: Arc<dyn Any + Send + Sync> = channel;
                 channel
             })
         };
@@ -144,26 +157,6 @@ impl<T> Receiver<T> {
         let pos = unsafe { std::ptr::read(&this.pos) };
 
         (channel, pos)
-    }
-}
-
-trait IsDynChannel: Send {
-    fn get_dyn(&self) -> Option<Result<(), RecvError>>;
-}
-
-impl<T: Send + Sync> IsDynChannel for Channel<T> {
-    fn get_dyn(&self) -> Option<Result<(), RecvError>> {
-        match self.get() {
-            Some(Ok(_)) => Some(Ok(())),
-            Some(Err(_)) => Some(Err(RecvError)),
-            None => None,
-        }
-    }
-}
-
-impl std::fmt::Debug for dyn IsDynChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("dyn IsDynChannel").finish()
     }
 }
 
@@ -192,6 +185,7 @@ impl<T> Clone for Receiver<T> {
         }
     }
 }
+
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(pos) = self.pos {
@@ -227,17 +221,17 @@ impl<'a, T> Unpin for RecvFut<'a, T> {}
 
 /// A listener that can be used to wait for a message to arrive.
 ///
-/// Can be used to erase the type of the channel.
+/// Can be used to erase the channel-type without overhead/boxing.
 #[derive(Debug, Clone)]
 pub struct Listener {
-    dyn_channel: OwningRef<'static, Arc<dyn IsDynChannel>, DynChannel>,
+    dyn_channel: OwningRef<'static, Arc<dyn Any + Send + Sync>, InnerChannel>,
     pos: Option<usize>,
 }
 
 impl Listener {
     /// Whether the message has been sent.
-    pub fn is_sent(&self) -> bool {
-        self.dyn_channel.is_sent()
+    pub fn ready(&self) -> bool {
+        self.dyn_channel.ready()
     }
 
     /// The number of receivers, including [`Listener`]s.
@@ -247,11 +241,29 @@ impl Listener {
 
     /// Get the value if it has been sent.
     pub fn get(&self) -> Option<Result<(), RecvError>> {
-        self.dyn_channel.as_owner().get_dyn()
+        self.dyn_channel.state()
+    }
+
+    /// Closes the channel.
+    pub fn close(&mut self) -> bool {
+        self.dyn_channel.set_state_closed()
+    }
+
+    /// Downcast the listener back into a receiver.
+    pub fn downcast<T>(&self) -> Option<Receiver<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let owner = OwningRef::as_owner(&self.dyn_channel);
+        match Arc::downcast::<Channel<T>>(owner.clone()) {
+            Ok(channel) => Some(Receiver { channel, pos: None }),
+            Err(_) => None,
+        }
     }
 }
 
 impl Unpin for Listener {}
+
 impl Future for Listener {
     type Output = Result<(), RecvError>;
 
@@ -271,5 +283,50 @@ impl Drop for Listener {
         if let Some(pos) = self.pos {
             self.dyn_channel.remove_pos(pos);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+    use super::*;
+
+    #[tokio::test]
+    async fn test_send() {
+        let (mut sender, mut receiver) = channel();
+
+        assert!(sender.send(1));
+        assert!(!sender.send(2));
+
+        assert_eq!(receiver.recv().await.unwrap(), &1);
+        (&mut receiver).await.unwrap();
+        assert_eq!(receiver.get().unwrap().unwrap(), &1);
+    }
+
+    #[tokio::test]
+    async fn test_listener() {
+        let (mut sender, receiver) = channel();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            sender.send(1);
+        });
+
+        let mut listener = receiver.into_listener();
+        (&mut listener).await.unwrap();
+        listener.get().unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_downcast() {
+        let (mut sender, receiver) = channel::<()>();
+
+        let listener = receiver.into_listener();
+        assert!(listener.downcast::<()>().is_some());
+        assert!(listener.downcast::<i32>().is_none());
+
+        assert!(sender.send(()));
+        assert!(listener.downcast::<()>().is_some());
+        assert!(listener.downcast::<i32>().is_none());
     }
 }

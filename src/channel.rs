@@ -1,9 +1,14 @@
+// Some code taken from std::sync::OnceLock
+
 use std::{
     cell::UnsafeCell,
     future::Future,
     mem::MaybeUninit,
     pin::Pin,
-    sync::{Mutex, Once, atomic::AtomicU8},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -11,58 +16,56 @@ use crate::{opt_vec::OptVec, RecvError};
 
 #[derive(Debug)]
 pub(crate) struct Channel<T> {
-    value: UnsafeCell<MaybeUninit<Result<T, RecvError>>>,
-    dyn_channel: DynChannel,
+    value: UnsafeCell<MaybeUninit<T>>,
+    inner: InnerChannel,
 }
 
-unsafe impl<T> Send for Channel<T> where T: Send + Sync {}
+impl<T> Drop for Channel<T> {
+    fn drop(&mut self) {
+        if self.ready() {
+            // SAFETY: The cell was initialized, and this is the only/last ref to it.
+            unsafe { (*self.value.get()).assume_init_drop() };
+        }
+    }
+}
+
+unsafe impl<T> Send for Channel<T> where T: Send {}
+unsafe impl<T> Sync for Channel<T> where T: Send + Sync {}
 
 impl<T> Channel<T> {
     pub(crate) fn new() -> Self {
         Self {
             value: UnsafeCell::new(MaybeUninit::uninit()),
-            dyn_channel: DynChannel {
-                once: Once::new(),
+            inner: InnerChannel {
                 wakers: Mutex::new(OptVec::new()),
+                state: AtomicU8::new(ACTIVE),
             },
         }
     }
 
-    pub(crate) fn close(&self) {
-        // Only runs if the value hasn't been sent yet.
-        self.dyn_channel.once.call_once(|| {
-            // Safe b/c we're the only thread that can access the value
-            unsafe {
-                self.value
-                    .get()
-                    .write(MaybeUninit::new(Err(RecvError)));
-            }
-        });
+    pub(crate) fn close(&self) -> bool {
+        self.inner.set_state_closed()
     }
 
     pub(crate) fn get(&self) -> Option<Result<&T, RecvError>> {
-        if self.is_sent() {
-            // Safe b/c checked for initialization
-            let val = unsafe { self.get_unchecked() };
-            match val {
-                Ok(val) => Some(Ok(val)),
-                Err(err) => Some(Err(*err)),
-            }
-        } else {
-            None
+        match self.inner.state() {
+            // Safety: The value is initialized
+            Some(Ok(())) => Some(Ok(unsafe { self.get_unchecked() })),
+            Some(Err(_)) => Some(Err(RecvError)),
+            None => None,
         }
     }
 
-    pub(crate) fn is_sent(&self) -> bool {
-        self.dyn_channel.once.is_completed()
+    pub(crate) fn ready(&self) -> bool {
+        self.inner.ready()
     }
 
-    pub(crate) fn inner(&self) -> &DynChannel {
-        &self.dyn_channel
+    pub(crate) fn inner(&self) -> &InnerChannel {
+        &self.inner
     }
 
     pub(crate) fn wake_all(&self) {
-        let mut wakers = self.dyn_channel.wakers.lock().unwrap();
+        let mut wakers = self.inner.wakers.lock().unwrap();
         let mut pos = 0;
         while let Some(waker) = wakers.get_mut(pos) {
             if let Some(waker) = waker.take() {
@@ -72,56 +75,91 @@ impl<T> Channel<T> {
         }
     }
 
-    pub(crate) fn set(&self, value: T) {
-        self.dyn_channel.once.call_once(|| {
-            // Safe b/c we're the only thread that can access the value
+    pub(crate) fn set(&self, value: T) -> bool {
+        // Only runs if the value hasn't been sent yet.
+        if self.inner.set_state_sending() {
+            // Safe b/c this can only be called once, and no other ref can be accessing this
             unsafe {
-                self.value.get().write(MaybeUninit::new(Ok(value)));
+                self.value.get().write(MaybeUninit::new(value));
             }
-        });
+            let res = self.inner.set_state_sent();
+            debug_assert!(res);
+            true
+        } else {
+            false
+        }
     }
 
     /// # Safety
     ///
     /// The value must be initialized
     #[inline]
-    unsafe fn get_unchecked(&self) -> &Result<T, RecvError> {
-        debug_assert!(self.dyn_channel.once.is_completed());
+    unsafe fn get_unchecked(&self) -> &T {
+        debug_assert!(self.ready());
         (*self.value.get()).assume_init_ref()
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct DynChannel {
-    once: Once,
+pub(crate) struct InnerChannel {
+    state: AtomicU8,
     wakers: Mutex<OptVec<Waker>>,
 }
 
-impl DynChannel {
+const ACTIVE: u8 = 0;
+const SENDING: u8 = 1;
+const SENT: u8 = 2;
+const CLOSED: u8 = 3;
+
+impl InnerChannel {
+    pub(crate) fn ready(&self) -> bool {
+        self.state.load(Ordering::Acquire) == SENT
+    }
+
+    pub(crate) fn set_state_closed(&self) -> bool {
+        self.state
+            .compare_exchange(ACTIVE, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn set_state_sending(&self) -> bool {
+        self.state
+            .compare_exchange(ACTIVE, SENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn set_state_sent(&self) -> bool {
+        self.state
+            .compare_exchange(SENDING, SENT, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub(crate) fn remove_pos(&self, pos: usize) {
-        if !self.once.is_completed() {
+        if !self.ready() {
             let mut wakers = self.wakers.lock().unwrap();
             wakers.remove(pos);
         }
     }
 
     pub(crate) fn listener_fut<'a>(&'a self, pos: &'a mut Option<usize>) -> ExitFut<'a> {
-        ExitFut {
-            pos,
-            once: &self.once,
-            wakers: &self.wakers,
-        }
+        ExitFut { pos, channel: self }
     }
 
-    pub(crate) fn is_sent(&self) -> bool {
-        self.once.is_completed()
+    /// Uses `Ordering::Acquire` to ensure that the value is initialized.
+    pub(crate) fn state(&self) -> Option<Result<(), RecvError>> {
+        match self.state.load(Ordering::Acquire) {
+            ACTIVE => None,
+            SENDING => None,
+            SENT => Some(Ok(())),
+            CLOSED => Some(Err(RecvError)),
+            _ => unreachable!(),
+        }
     }
 }
 
 pub(crate) struct ExitFut<'a> {
     pos: &'a mut Option<usize>,
-    once: &'a Once,
-    wakers: &'a Mutex<OptVec<Waker>>,
+    channel: &'a InnerChannel,
 }
 
 impl<'a> Unpin for ExitFut<'a> {}
@@ -130,28 +168,27 @@ impl<'a> Future for ExitFut<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Return if the value is ready
-        if self.once.is_completed() {
+        if self.channel.ready() {
             return Poll::Ready(());
         }
 
         // Replace our waker if it's not the same as the one we have.
         if let Some(pos) = &self.pos {
-            let mut wakers = self.wakers.lock().unwrap();
-
+            let mut wakers = self.channel.wakers.lock().unwrap();
             let my_waker = wakers.get_mut(*pos).unwrap();
+
             if !my_waker.as_ref().unwrap().will_wake(cx.waker()) {
                 *my_waker = Some(cx.waker().clone());
             }
         }
         // Otherwise, add our waker to the list.
         else {
-            let mut wakers = self.wakers.lock().unwrap();
-
+            let mut wakers = self.channel.wakers.lock().unwrap();
             *self.pos = Some(wakers.add(cx.waker().clone()));
         }
 
         // Check if the value is ready again.
-        if self.once.is_completed() {
+        if self.channel.ready() {
             Poll::Ready(())
         } else {
             Poll::Pending
