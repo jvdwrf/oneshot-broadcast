@@ -6,12 +6,10 @@ A oneshot-broadcast channel that broadcasts a value once without cloning the mes
 
 # Example
 ```rust
-use oneshot_broadcast::*;
-
 #[tokio::main]
 async fn main() {
     // Create the oneshot-broadcast channel
-    let (mut sender, mut receiver) = channel::<u32>();
+    let (mut sender, mut receiver) = oneshot_broadcast::channel::<u32>();
 
     // Send a message through the sender
     sender.send(10);
@@ -26,7 +24,7 @@ async fn main() {
     // Or, if we're sure that it's ready:
     assert_eq!(receiver.get().unwrap().unwrap(), &10);
 
-    // As an extra feature, we can erase the receiver_type by
+    // As an extra feature, we can erase the receiver-type by
     // turning it into a listener:
     let listener /* : Listener */ = receiver.into_listener();
     assert_eq!(listener.await, Ok(()));

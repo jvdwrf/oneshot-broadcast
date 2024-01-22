@@ -20,6 +20,8 @@ pub(crate) struct Channel<T> {
     inner: InnerChannel,
 }
 
+impl<T> Unpin for Channel<T> {}
+
 impl<T> Drop for Channel<T> {
     fn drop(&mut self) {
         if self.ready() {

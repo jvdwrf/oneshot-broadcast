@@ -1,17 +1,18 @@
 [package]
 name = "oneshot-broadcast"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 keywords = ["channel", "oneshot", "broadcast", "sync"]
 categories = ["asynchronous", "concurrency", "data-structures"]
-description = "Sets implemented in the rust type-system"
+description = "A oneshot-broadcast channel that broadcasts a value once without cloning it."
 homepage = "https://github.com/jvdwrf/oneshot-broadcast"
 repository = "https://github.com/jvdwrf/oneshot-broadcast"
 readme = "README.md"
 
 [dependencies]
 safer_owning_ref = "0.5"
+futures = { version = "0.3", features = ["executor"] }
 
 [dev-dependencies]
 tokio = { version = "1.16", features = ["full"] }

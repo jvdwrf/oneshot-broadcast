@@ -1,8 +1,10 @@
 #[doc = include_str!("../README.md")]
 pub(crate) mod channel;
+pub(crate) mod dynamic;
 pub(crate) mod opt_vec;
 
 use channel::{Channel, InnerChannel};
+use futures::{executor::block_on, FutureExt};
 use owning_ref::OwningRef;
 use std::{
     any::Any,
@@ -107,11 +109,24 @@ impl<T> Receiver<T> {
     /// let value = receiver.get().unwrap()
     /// ```
     pub fn recv(&mut self) -> RecvFut<'_, T> {
-        RecvFut { receiver: self }
+        RecvFut {
+            channel: &mut self.channel,
+            pos: &mut self.pos,
+        }
+    }
+
+    /// Same as [`Receiver::recv`], but blocks the current thread.
+    pub fn recv_blocking(&mut self) -> Result<&T, RecvError> {
+        block_on(self.recv())
+    }
+
+    /// Same as `.await`, but blocks the current thread.
+    pub fn wait(&mut self) -> Result<(), RecvError> {
+        block_on(self)
     }
 
     /// Closes the channel.
-    pub fn close(&mut self) -> bool {
+    pub fn close(&self) -> bool {
         self.channel.close()
     }
 
@@ -137,16 +152,7 @@ impl<T> Receiver<T> {
         T: Send + Sync + 'static,
     {
         let (channel, pos) = self.into_parts();
-        let dyn_channel = OwningRef::new(channel).map(|channel| channel.inner());
-        let dyn_channel = unsafe {
-            // Safety: We're not moving the address of the channel
-            // T has to be send + Sync for the Listener to be send.
-            dyn_channel.map_owner(|channel| {
-                let channel: Arc<dyn Any + Send + Sync> = channel;
-                channel
-            })
-        };
-        Listener { dyn_channel, pos }
+        Listener::new(channel, pos)
     }
 
     fn into_parts(self) -> (Arc<Channel<T>>, Option<usize>) {
@@ -190,18 +196,21 @@ impl<T> Drop for Receiver<T> {
 
 /// Future that waits for the message to arrive.
 pub struct RecvFut<'a, T> {
-    receiver: &'a mut Receiver<T>,
+    channel: &'a Channel<T>,
+    pos: &'a mut Option<usize>,
 }
 
 impl<'a, T: 'a> Future for RecvFut<'a, T> {
     type Output = Result<&'a T, RecvError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.receiver).poll(cx) {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        match this.channel.inner().exit_fut(this.pos).poll_unpin(cx) {
             Poll::Ready(_) => {
                 // Safety: Lifetime of `val` is tied to the lifetime of `self.receiver`
                 // todo: Can this be done without transmute?
-                let val: Result<&'_ T, RecvError> = self.receiver.get().unwrap();
+                let val: Result<&'_ T, RecvError> = this.channel.get().unwrap();
                 let val: Result<&'a T, RecvError> = unsafe { std::mem::transmute(val) };
 
                 Poll::Ready(val)
@@ -223,6 +232,22 @@ pub struct Listener {
 }
 
 impl Listener {
+    pub(crate) fn new<T: Send + Sync + 'static>(
+        channel: Arc<Channel<T>>,
+        pos: Option<usize>,
+    ) -> Self {
+        let dyn_channel = OwningRef::new(channel).map(|channel| channel.inner());
+        let dyn_channel = unsafe {
+            // Safety: We're not moving the address of the channel
+            // T has to be send + Sync for the Listener to be send.
+            dyn_channel.map_owner(|channel| {
+                let channel: Arc<dyn Any + Send + Sync> = channel;
+                channel
+            })
+        };
+        Listener { dyn_channel, pos }
+    }
+
     /// Whether the message has been sent.
     pub fn ready(&self) -> bool {
         self.dyn_channel.ready()
@@ -241,6 +266,11 @@ impl Listener {
     /// Closes the channel.
     pub fn close(&mut self) -> bool {
         self.dyn_channel.set_state_closed()
+    }
+
+    /// Same as `.await`, but blocks the current thread.
+    pub fn wait(&mut self) -> Result<(), RecvError> {
+        block_on(self)
     }
 
     /// Downcast the listener back into a receiver.
@@ -263,8 +293,7 @@ impl Future for Listener {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut fut = this.dyn_channel.exit_fut(&mut this.pos);
-        Pin::new(&mut fut).poll(cx)
+        this.dyn_channel.exit_fut(&mut this.pos).poll_unpin(cx)
     }
 }
 
@@ -350,5 +379,28 @@ mod tests {
         });
 
         assert!(receiver.recv().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lifetime() {
+        let (mut sender, receiver) = channel();
+
+        sender.send(1);
+
+        {
+            let mut receiver = receiver.clone();
+            let fut = receiver.recv();
+            let _val = fut.await.unwrap();
+            drop(receiver);
+            // assert_eq!(_val, &1); // doesn't compile
+        }
+
+        {
+            let mut receiver = receiver.clone();
+            let mut fut = receiver.recv();
+            let _val = (&mut fut).await.unwrap();
+            drop(receiver);
+            // assert_eq!(_val, &1); // doesn't compile
+        }
     }
 }
