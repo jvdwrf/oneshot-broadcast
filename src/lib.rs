@@ -1,309 +1,282 @@
 #[doc = include_str!("../README.md")]
 pub(crate) mod channel;
-pub(crate) mod dynamic;
 pub(crate) mod opt_vec;
 
-use channel::{Channel, InnerChannel};
-use futures::{executor::block_on, FutureExt};
+use futures::Future;
 use owning_ref::OwningRef;
 use std::{
     any::Any,
-    future::Future,
-    mem::ManuallyDrop,
+    future::IntoFuture,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
-/// Create a new `oneshot-broadcast` channel.
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let channel = Arc::new(Channel::new());
-    (
-        Sender {
-            channel: channel.clone(),
-        },
-        Receiver { channel, pos: None },
-    )
-}
+pub use channel::*;
 
-/// The sender half of a `oneshot-broadcast` channel.
-///
-/// This can be used to send a value to all receivers without cloning.
+//-------------------------------------
+// Channel
+//-------------------------------------
+
 #[derive(Debug)]
-pub struct Sender<T> {
-    channel: Arc<Channel<T>>,
+pub struct Channel<T> {
+    inner: Arc<InnerChannel<T>>,
 }
 
-impl<T> Sender<T> {
-    /// Send a value to all receivers.
-    ///
-    /// Returns `false` if a value has already been sent.
-    pub fn send(&mut self, value: T) -> bool
-    where
-        T: 'static,
-    {
-        // First we set the value.
-        let res = self.channel.set(value);
+impl<T> Clone for Channel<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
 
-        // Then we wake all the wakers.
-        self.channel.wake_all();
-
-        res
+impl<T> Channel<T> {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(InnerChannel::new()),
+        }
     }
 
-    /// Whether the message has been sent.
-    pub fn is_sent(&self) -> bool {
-        self.channel.ready()
+    /// Erase the type of the channel.
+    pub fn into_any(self) -> AnyChannel
+    where
+        T: Send + Sync + 'static,
+    {
+        let inner = OwningRef::new(self.inner).map(|channel| channel.as_any());
+        // Safety: We're not moving the address of the channel
+        let inner = unsafe {
+            inner.map_owner(|channel| {
+                let channel: Arc<dyn Any + Send + Sync> = channel;
+                channel
+            })
+        };
+        AnyChannel { inner }
+    }
+
+    /// Send a value into the channel.
+    pub fn send(&self, value: T) -> Result<(), T> {
+        self.inner.send(value)
     }
 
     /// Get the value if it has been sent.
-    pub fn get(&self) -> Option<Result<&T, RecvError>> {
-        self.channel.get()
+    pub fn get_value(&self) -> Option<Result<&T, Closed>> {
+        self.inner.get()
     }
 
-    /// The number of receivers, including [`Listener`]s.
-    pub fn receiver_count(&self) -> usize {
-        Arc::strong_count(&self.channel) - 1
+    /// Try to convert the channel into a value.
+    pub fn into_value(self) -> Result<Value<T>, Self> {
+        if self.inner.contains_value() {
+            Ok(unsafe { Value::new(self) })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// The number of references to the channel.
+    pub fn ref_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 
     /// Closes the channel.
     pub fn close(&mut self) -> bool {
-        self.channel.close()
+        self.inner.close()
+    }
+
+    pub fn recv(&self) -> RecvFut<'_, T> {
+        self.into_future()
+    }
+
+    pub fn into_recv(self) -> IntoRecvFut<T> {
+        self.into_future()
     }
 }
 
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        self.channel.close();
+impl<T> Default for Channel<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// The receiver half of a `oneshot-broadcast` channel.
-///
-/// This can be used to receive a value from the sender, and is cloneable.
-/// All receivers will receive a reference to the same value.
-///
-/// The receiver can be `await`ed to wait for the message, and the
-/// value can be retrieved by calling `get`. Alternatively, one can call `recv` to
-/// do the same thing.
-///
-/// Receivers can also be converted into a `Listener` which can be used to wait
-/// for the message.
-#[derive(Debug)]
-pub struct Receiver<T> {
-    channel: Arc<Channel<T>>,
-    pos: Option<usize>,
-}
+impl<T> IntoFuture for Channel<T> {
+    type Output = Result<Value<T>, Closed>;
+    type IntoFuture = IntoRecvFut<T>;
 
-/// The channel was closed before the message was sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecvError;
-
-impl<T> Receiver<T> {
-    /// Wait for the message, and return a reference to the result.
-    ///
-    /// This is the same as:
-    /// ```ignore
-    /// let mut receiver: Receiver<_> = ...;
-    /// let _ = (&mut receiver).await;
-    /// let value = receiver.get().unwrap()
-    /// ```
-    pub fn recv(&mut self) -> RecvFut<'_, T> {
-        RecvFut {
-            channel: &mut self.channel,
-            pos: &mut self.pos,
-        }
-    }
-
-    /// Same as [`Receiver::recv`], but blocks the current thread.
-    pub fn recv_blocking(&mut self) -> Result<&T, RecvError> {
-        block_on(self.recv())
-    }
-
-    /// Same as `.await`, but blocks the current thread.
-    pub fn wait(&mut self) -> Result<(), RecvError> {
-        block_on(self)
-    }
-
-    /// Closes the channel.
-    pub fn close(&self) -> bool {
-        self.channel.close()
-    }
-
-    /// Whether the message has been sent, and is now ready.
-    pub fn ready(&self) -> bool {
-        self.channel.ready()
-    }
-
-    /// Get the value if it has been sent.
-    pub fn get(&self) -> Option<Result<&T, RecvError>> {
-        self.channel.get()
-    }
-
-    /// The number of receivers, including [`Listener`]s.
-    pub fn receiver_count(&self) -> usize {
-        Arc::strong_count(&self.channel) - 1
-    }
-
-    /// Convert the receiver into a listener that can be used to wait for
-    /// the message.
-    pub fn into_listener(self) -> Listener
-    where
-        T: Send + Sync + 'static,
-    {
-        let (channel, pos) = self.into_parts();
-        Listener::new(channel, pos)
-    }
-
-    fn into_parts(self) -> (Arc<Channel<T>>, Option<usize>) {
-        let this = ManuallyDrop::new(self);
-
-        // Safety: We're taking out ALL values of the struct, not causing
-        // any leaking, and using manually drop to prevent double drop.
-        let channel = unsafe { std::ptr::read(&this.channel) };
-        let pos = unsafe { std::ptr::read(&this.pos) };
-
-        (channel, pos)
-    }
-}
-
-impl<T> Future for Receiver<T> {
-    type Output = Result<(), RecvError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut fut = this.channel.inner().exit_fut(&mut this.pos);
-        Pin::new(&mut fut).poll(cx)
-    }
-}
-
-impl<T> Clone for Receiver<T> {
-    fn clone(&self) -> Self {
-        Self {
-            channel: self.channel.clone(),
+    fn into_future(self) -> Self::IntoFuture {
+        IntoRecvFut {
+            channel: Some(self),
             pos: None,
         }
     }
 }
 
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        if let Some(pos) = self.pos {
-            self.channel.inner().remove_pos(pos);
-        }
+impl<'a, T> IntoFuture for &'a Channel<T> {
+    type Output = Result<&'a T, Closed>;
+    type IntoFuture = RecvFut<'a, T>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        self.inner.into_future()
     }
 }
 
-/// Future that waits for the message to arrive.
-pub struct RecvFut<'a, T> {
-    channel: &'a Channel<T>,
-    pos: &'a mut Option<usize>,
-}
+impl<'a, T> IntoFuture for &'a mut Channel<T> {
+    type Output = Result<&'a T, Closed>;
+    type IntoFuture = RecvFut<'a, T>;
 
-impl<'a, T: 'a> Future for RecvFut<'a, T> {
-    type Output = Result<&'a T, RecvError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        match this.channel.inner().exit_fut(this.pos).poll_unpin(cx) {
-            Poll::Ready(_) => {
-                // Safety: Lifetime of `val` is tied to the lifetime of `self.receiver`
-                // todo: Can this be done without transmute?
-                let val: Result<&'_ T, RecvError> = this.channel.get().unwrap();
-                let val: Result<&'a T, RecvError> = unsafe { std::mem::transmute(val) };
-
-                Poll::Ready(val)
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn into_future(self) -> Self::IntoFuture {
+        self.inner.into_future()
     }
 }
 
-impl<'a, T> Unpin for RecvFut<'a, T> {}
+//-------------------------------------
+// IntoRecvFut
+//-------------------------------------
 
-/// A listener that can be used to wait for a message to arrive.
-///
-/// Can be used to erase the channel-type without overhead/boxing.
-#[derive(Debug, Clone)]
-pub struct Listener {
-    dyn_channel: OwningRef<'static, Arc<dyn Any + Send + Sync>, InnerChannel>,
+pub struct IntoRecvFut<T> {
+    channel: Option<Channel<T>>,
     pos: Option<usize>,
 }
 
-impl Listener {
-    pub(crate) fn new<T: Send + Sync + 'static>(
-        channel: Arc<Channel<T>>,
-        pos: Option<usize>,
-    ) -> Self {
-        let dyn_channel = OwningRef::new(channel).map(|channel| channel.inner());
-        let dyn_channel = unsafe {
-            // Safety: We're not moving the address of the channel
-            // T has to be send + Sync for the Listener to be send.
-            dyn_channel.map_owner(|channel| {
-                let channel: Arc<dyn Any + Send + Sync> = channel;
-                channel
-            })
-        };
-        Listener { dyn_channel, pos }
-    }
+impl<T> Unpin for IntoRecvFut<T> {}
 
-    /// Whether the message has been sent.
-    pub fn ready(&self) -> bool {
-        self.dyn_channel.ready()
-    }
+impl<T> Future for IntoRecvFut<T> {
+    type Output = Result<Value<T>, Closed>;
 
-    /// The number of receivers, including [`Listener`]s.
-    pub fn receiver_count(&self) -> usize {
-        Arc::strong_count(OwningRef::as_owner(&self.dyn_channel)) - 1
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let channel = this.channel.as_mut().unwrap();
+        ready!(channel.inner.as_any().poll_with_pos(cx, &mut this.pos))?;
+
+        // SAFETY: The value is initialized here
+        let value = unsafe { Value::new(this.channel.take().unwrap()) };
+        Poll::Ready(Ok(value))
+    }
+}
+
+impl<T> Drop for IntoRecvFut<T> {
+    fn drop(&mut self) {
+        if let Some(channel) = self.channel.take() {
+            if let Some(pos) = self.pos {
+                channel.inner.as_any().remove(pos);
+            }
+        }
+    }
+}
+
+//-------------------------------------
+// AnyChannel
+//-------------------------------------
+
+pub use value::*;
+mod value;
+
+#[derive(Debug)]
+pub struct AnyChannel {
+    inner: OwningRef<'static, Arc<dyn Any + Send + Sync>, InnerSubChannel>,
+}
+
+impl AnyChannel {
+    pub fn downcast<T>(&self) -> Option<Channel<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let owner = OwningRef::as_owner(&self.inner);
+        match Arc::downcast::<InnerChannel<T>>(owner.clone()) {
+            Ok(channel) => Some(Channel { inner: channel }),
+            Err(_) => None,
+        }
     }
 
     /// Get the value if it has been sent.
-    pub fn get(&self) -> Option<Result<(), RecvError>> {
-        self.dyn_channel.state()
+    pub fn get_value(&self) -> Option<Result<(), Closed>> {
+        self.inner.get()
+    }
+
+    /// The number of references to the channel.
+    pub fn ref_count(&self) -> usize {
+        Arc::strong_count(self.inner.as_owner())
     }
 
     /// Closes the channel.
     pub fn close(&mut self) -> bool {
-        self.dyn_channel.set_state_closed()
+        self.inner.close()
     }
 
-    /// Same as `.await`, but blocks the current thread.
-    pub fn wait(&mut self) -> Result<(), RecvError> {
-        block_on(self)
+    pub fn recv(&self) -> AnyRecvFut<'_> {
+        self.into_future()
     }
 
-    /// Downcast the listener back into a receiver.
-    pub fn downcast<T>(&self) -> Option<Receiver<T>>
-    where
-        T: Send + Sync + 'static,
-    {
-        let owner = OwningRef::as_owner(&self.dyn_channel);
-        match Arc::downcast::<Channel<T>>(owner.clone()) {
-            Ok(channel) => Some(Receiver { channel, pos: None }),
-            Err(_) => None,
+    pub fn into_recv(self) -> IntoAnyRecvFut {
+        self.into_future()
+    }
+}
+
+impl IntoFuture for AnyChannel {
+    type Output = Result<(), Closed>;
+    type IntoFuture = IntoAnyRecvFut;
+
+    fn into_future(self) -> Self::IntoFuture {
+        IntoAnyRecvFut {
+            channel: Some(self),
+            pos: None,
         }
     }
 }
 
-impl Unpin for Listener {}
+impl<'a> IntoFuture for &'a AnyChannel {
+    type Output = Result<(), Closed>;
+    type IntoFuture = AnyRecvFut<'a>;
 
-impl Future for Listener {
-    type Output = Result<(), RecvError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        this.dyn_channel.exit_fut(&mut this.pos).poll_unpin(cx)
+    fn into_future(self) -> Self::IntoFuture {
+        self.inner.into_future()
     }
 }
 
-impl Drop for Listener {
+impl<'a> IntoFuture for &'a mut AnyChannel {
+    type Output = Result<(), Closed>;
+    type IntoFuture = AnyRecvFut<'a>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        self.inner.into_future()
+    }
+}
+
+//-------------------------------------
+// IntoAnyRecvFut
+//-------------------------------------
+
+#[derive(Debug)]
+pub struct IntoAnyRecvFut {
+    channel: Option<AnyChannel>,
+    pos: Option<usize>,
+}
+
+impl Unpin for IntoAnyRecvFut {}
+
+impl Future for IntoAnyRecvFut {
+    type Output = Result<(), Closed>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let channel = this.channel.as_mut().unwrap();
+        ready!(channel.inner.poll_with_pos(cx, &mut this.pos))?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for IntoAnyRecvFut {
     fn drop(&mut self) {
-        if let Some(pos) = self.pos {
-            self.dyn_channel.remove_pos(pos);
+        if let Some(channel) = self.channel.take() {
+            if let Some(pos) = self.pos {
+                channel.inner.remove(pos);
+            }
         }
     }
 }
+
+//-------------------------------------
+// Tests
+//-------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -312,83 +285,68 @@ mod tests {
 
     #[tokio::test]
     async fn test_send() {
-        let (mut sender, mut receiver) = channel();
+        let channel = Channel::new();
 
-        assert!(sender.send(1));
-        assert!(!sender.send(2));
+        assert!(channel.send(1).is_ok());
+        assert!(channel.send(2).is_err());
 
-        assert_eq!(receiver.recv().await.unwrap(), &1);
-        (&mut receiver).await.unwrap();
-        assert_eq!(receiver.get().unwrap().unwrap(), &1);
+        assert_eq!(channel.clone().await.unwrap(), 1);
+        channel.clone().await.unwrap();
+        assert_eq!(channel.get_value().unwrap().unwrap(), &1);
     }
 
     #[tokio::test]
     async fn test_listener() {
-        let (mut sender, receiver) = channel();
+        let channel = Channel::new();
+        let mut any_channel = channel.clone().into_any();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            sender.send(1);
+            channel.send(1).ok();
         });
 
-        let mut listener = receiver.into_listener();
-        (&mut listener).await.unwrap();
-        listener.get().unwrap().unwrap();
+        (&mut any_channel).await.unwrap();
+        any_channel.get_value().unwrap().unwrap();
     }
 
     #[test]
     fn test_downcast() {
-        let (mut sender, receiver) = channel::<()>();
-
-        let listener = receiver.into_listener();
-        assert!(listener.downcast::<()>().is_some());
-        assert!(listener.downcast::<i32>().is_none());
-
-        assert!(sender.send(()));
-        assert!(listener.downcast::<()>().is_some());
-        assert!(listener.downcast::<i32>().is_none());
+        let channel = Channel::<()>::new().into_any();
+        assert!(channel.downcast::<()>().is_some());
+        assert!(channel.downcast::<i32>().is_none());
     }
 
     #[tokio::test]
     async fn test_drop_sender() {
-        let (sender, mut receiver) = channel::<()>();
-
-        drop(sender);
-        assert!(receiver.recv().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_drop_sender_while_receiving() {
-        let (sender, mut receiver) = channel::<()>();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            drop(sender);
-        });
-
-        assert!(receiver.recv().await.is_err());
+        let channel = Channel::<()>::new();
+        let channel2 = channel.clone();
+        drop(channel);
+        channel2.send(()).unwrap();
+        assert!(channel2.await.is_ok());
     }
 
     #[tokio::test]
     async fn test_send_while_receiving() {
-        let (mut sender, mut receiver) = channel::<()>();
+        let channel = Channel::new();
+        let channel2 = channel.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            sender.send(());
+            channel2.send(()).ok();
         });
 
-        assert!(receiver.recv().await.is_ok());
+        assert!(channel.recv().await.is_ok());
     }
 
     #[tokio::test]
     async fn test_lifetime() {
-        let (mut sender, receiver) = channel();
+        let channel = Channel::new();
+        let channel2 = channel.clone();
 
-        sender.send(1);
+        channel.send(1).ok();
 
         {
-            let mut receiver = receiver.clone();
+            let receiver = channel2.clone();
             let fut = receiver.recv();
             let _val = fut.await.unwrap();
             drop(receiver);
@@ -396,7 +354,7 @@ mod tests {
         }
 
         {
-            let mut receiver = receiver.clone();
+            let receiver = channel2.clone();
             let mut fut = receiver.recv();
             let _val = (&mut fut).await.unwrap();
             drop(receiver);
